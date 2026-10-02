@@ -8,8 +8,58 @@ DB=$STATE/rules.tsv
 INSTALLED=/usr/local/sbin/nft-port-forward
 TABLE=codex_port_forward
 TAG=codex-port-forward-managed
+LOCK=/run/nft-port-forward.flock
+PIDFILE=/run/nft-port-forward.pid
+LEGACY_LOCK=/run/nft-port-forward.lock
+LOCK_HELD=0
 
 die() { printf '\n错误：%s\n' "$*" >&2; exit 1; }
+
+# Keep this file in place: unlinking a flock file allows two independent locks.
+# The kernel releases the lock even after SIGKILL. The PID is informational only.
+acquire_lock() {
+    exec 9>>"$LOCK"
+    if ! flock -n 9; then
+        owner='未知'
+        if [ -r "$PIDFILE" ]; then
+            read -r recorded_pid < "$PIDFILE" || recorded_pid=''
+            case "$recorded_pid" in
+                ''|*[!0-9]*) ;;
+                *) owner=$recorded_pid ;;
+            esac
+        fi
+        die "另一个实例正在操作规则（PID：$owner）。请在原菜单输入 0 退出后重试。"
+    fi
+    LOCK_HELD=1
+    printf '%s\n' "$$" > "$PIDFILE"
+
+    # Upgrade the old mkdir lock only when no old script process remains.
+    if [ -d "$LEGACY_LOCK" ]; then
+        legacy_pid=''
+        for cmdline in /proc/[0-9]*/cmdline; do
+            [ -r "$cmdline" ] || continue
+            process_pid=${cmdline#/proc/}
+            process_pid=${process_pid%/cmdline}
+            [ "$process_pid" != "$$" ] || continue
+            if tr '\000' '\n' < "$cmdline" 2>/dev/null | awk '
+                /(^|\/)nft-port-forward(\.sh)?$/ { found=1 }
+                END { exit !found }'; then
+                legacy_pid=$process_pid
+                break
+            fi
+        done
+        [ -z "$legacy_pid" ] || die "旧版脚本仍在运行（PID：$legacy_pid），请先在旧菜单输入 0 退出。"
+        rmdir "$LEGACY_LOCK" 2>/dev/null || die '旧锁目录非空，请检查 /run/nft-port-forward.lock 后重试。'
+        printf '已自动清理旧版残留锁。\n'
+    fi
+}
+
+cleanup() {
+    if [ "$LOCK_HELD" -eq 1 ]; then
+        rm -f "$STATE/pending.tsv" "$PIDFILE"
+        # Do not remove $LOCK. Closing fd 9 on process exit releases ownership.
+    fi
+}
 
 valid_port() {
     printf '%s\n' "$1" | awk '
@@ -116,6 +166,49 @@ show_rules() {
     fi
 }
 
+default_export_path() {
+    printf './nft-port-forward-rules-%s-%s.tsv\n' "$(date +%Y%m%d-%H%M%S)" "$$"
+}
+
+# Write in the destination directory, then publish without overwriting any path.
+export_rules() (
+    destination=$1
+    case "$destination" in
+        /*) ;;
+        *) destination=./$destination ;;
+    esac
+    case "$destination" in */) printf '导出路径必须包含文件名。\n' >&2; exit 1 ;; esac
+    [ -f "$DB" ] || { printf '没有可导出的规则文件。\n' >&2; exit 1; }
+    validate_db "$DB" || { printf '规则文件无效，导出已取消。\n' >&2; exit 1; }
+    if [ -e "$destination" ] || [ -L "$destination" ]; then
+        printf '目标已存在，请换一个文件名：%s\n' "$destination" >&2
+        exit 1
+    fi
+    export_parent=${destination%/*}
+    [ -d "$export_parent" ] || { printf '目标目录不存在：%s\n' "$export_parent" >&2; exit 1; }
+    export_tmp=$(mktemp "$export_parent/.nft-port-forward-export.XXXXXX") || exit 1
+    trap 'rm -f "$export_tmp"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM HUP
+    cat "$DB" > "$export_tmp" || exit 1
+    chmod 600 "$export_tmp" || exit 1
+    ln -T "$export_tmp" "$destination" || exit 1
+    printf '\n已导出 %s 条规则：%s\n' "$(awk 'END {print NR+0}' "$DB")" "$destination"
+    printf '格式：监听端口、目标 IPv4、目标端口、协议（Tab 分隔）。\n'
+)
+
+export_menu() {
+    default_path=$(default_export_path)
+    printf '\n导出文件路径 [默认 %s]：' "$default_path"
+    read -r destination || exit 0
+    [ -n "$destination" ] || destination=$default_path
+    if export_rules "$destination"; then
+        :
+    else
+        printf '导出失败，原有规则未修改。\n' >&2
+    fi
+}
+
 commit_rules() {
     # Apply first; preserve the saved database if nft rejects the change.
     if (set -e; apply_db "$STATE/pending.tsv"); then
@@ -204,24 +297,32 @@ SERVICE
 [ "$(id -u)" -eq 0 ] || die '请以 root 身份运行。'
 [ -f /etc/alpine-release ] || die '本脚本适用于 Alpine Linux。'
 mode=${1:-menu}
-case "$mode" in menu|--apply|--stop) ;; *) die '用法：nft-port-forward [--apply|--stop]' ;; esac
-if ! command -v nft >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+case "$mode" in
+    menu|--apply|--stop) [ "$#" -le 1 ] || die '该选项不接受额外参数。' ;;
+    --export) [ "$#" -le 2 ] || die '用法：nft-port-forward --export [文件路径]' ;;
+    *) die '用法：nft-port-forward [--apply|--stop|--export [文件路径]]' ;;
+esac
+if [ "$mode" != --export ] && { ! command -v nft >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; }; then
     [ "$mode" = menu ] || die '缺少 nftables 或 jq，请重新运行交互安装。'
     apk add --no-cache nftables jq
+fi
+if ! command -v flock >/dev/null 2>&1; then
+    apk add --no-cache util-linux
+    command -v flock >/dev/null 2>&1 || die '未找到 flock，请检查 util-linux 是否安装成功。'
+fi
+
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
+acquire_lock
+
+if [ "$mode" = --export ]; then
+    export_rules "${2:-$(default_export_path)}"
+    exit 0
 fi
 mkdir -p "$STATE"
 chmod 700 "$STATE"
 [ -f "$DB" ] || : > "$DB"
-
-# Prevent concurrent edits or overlap with OpenRC startup/shutdown.
-LOCK=/run/nft-port-forward.lock
-if ! mkdir "$LOCK" 2>/dev/null; then
-    die '另一个脚本实例正在运行；如曾被强制终止，请确认无实例后删除 /run/nft-port-forward.lock。'
-fi
-cleanup() { rm -f "$STATE/pending.tsv"; rmdir "$LOCK" 2>/dev/null || :; }
-trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
 
 case "$mode" in
     --apply) apply_db "$DB"; exit 0 ;;
@@ -233,14 +334,15 @@ printf '\nIPv4 端口转发管理\n'
 printf '适用于外部设备连接本机；目标服务器看到的是本机出口 IP。\n'
 printf '脚本不会修改 /etc/nftables.nft，规则单独保存并开机恢复。\n'
 while :; do
-    printf '\n1) 添加规则\n2) 查看规则\n3) 删除规则\n4) 重新应用所有规则\n0) 退出\n请选择：'
+    printf '\n1) 添加规则\n2) 查看规则\n3) 删除规则\n4) 重新应用所有规则\n5) 导出规则\n0) 退出\n请选择：'
     read -r action || exit 0
     case "$action" in
         1) add_rule ;;
         2) show_rules ;;
         3) delete_rule ;;
         4) cp "$DB" "$STATE/pending.tsv"; commit_rules ;;
+        5) export_menu ;;
         0) exit 0 ;;
-        *) printf '请选择 0–4。\n' ;;
+        *) printf '请选择 0–5。\n' ;;
     esac
 done

@@ -10,10 +10,12 @@
 - 单独保存转发规则，通过 OpenRC 在开机时恢复。
 - 保留已有防火墙配置，向现有 IPv4 转发过滤链添加对应放行规则。
 - 应用前检查 nftables 配置；使用一次事务更新规则。
+- 使用系统文件锁防止重复运行，异常退出后自动释放；升级时自动清理无人使用的旧锁目录。
+- 导出脚本管理的规则为 TSV 文件，支持菜单和命令行备份。
 
 ## 运行环境
 
-Alpine Linux、OpenRC、root 权限，以及支持 nftables、连接跟踪和 NAT 的内核。首次运行需要访问 Alpine 软件仓库。
+Alpine Linux、OpenRC、root 权限，以及支持 nftables、连接跟踪和 NAT 的内核。首次运行需要访问 Alpine 软件仓库。脚本自动安装 `nftables`、`jq`，以及提供 `flock` 的 `util-linux`（未安装时）。
 
 本脚本用于外部设备连接 Alpine 本机地址的端口，不处理本机发起的连接，也不支持 IPv6、域名或端口范围。容器环境需要宿主机授予管理网络规则的权限。
 
@@ -38,12 +40,55 @@ nft-port-forward
 2) 查看规则
 3) 删除规则
 4) 重新应用所有规则
+5) 导出规则
 0) 退出
 ```
 
 例如，输入监听端口 `60001`、目标 IPv4 `192.0.2.10`、目标端口 `33004`，再选择 TCP、UDP 或两者。`192.0.2.10` 是文档示例地址，请替换为实际目标。
 
 如果 GitHub 仓库为私有，下载文件需要登录或使用已有的 GitHub 授权；匿名下载链接无法直接读取私有脚本。
+
+## 升级旧版
+
+先在旧版管理菜单输入 `0` 退出，再上传新版文件并执行：
+
+```sh
+sh nft-port-forward.sh
+```
+
+升级会保留 `/etc/nft-port-forward/rules.tsv` 中的已有规则。确认没有旧版进程运行时，新版会自动清理旧的 `/run/nft-port-forward.lock` 目录，无需手动删除。若检测到旧版进程，则显示其 PID 并停止，避免两个版本同时修改规则。
+
+新版使用 `/run/nft-port-forward.flock`。该文件可以长期存在；是否占用由内核判断，脚本退出或进程被强制终止后自动释放。请不要删除这个文件。若确有另一实例运行，错误信息会显示 PID，应先退出原菜单。
+
+## 导出规则
+
+在菜单选择 `5`，输入保存路径，或直接回车使用当前目录中带时间戳的文件名。也可以退出菜单后执行：
+
+```sh
+nft-port-forward --export /root/forward-backup.tsv
+
+# 省略路径，保存到当前目录
+nft-port-forward --export
+```
+
+导出的是本脚本保存的转发规则，不包含其他防火墙规则。每行有四列，以 Tab 分隔，不含标题行：
+
+```text
+60001   192.0.2.10   33004   both
+```
+
+目标目录必须存在；已有文件或符号链接不会被覆盖。导出文件权限为 `600`，仅文件所有者可读写。即使没有规则，也可以导出空备份。
+
+在另一台已安装本脚本的 Alpine 上恢复时，退出管理菜单，先备份原规则，再替换并应用（会替换该机器保存的全部脚本规则）：
+
+```sh
+cp /etc/nft-port-forward/rules.tsv /etc/nft-port-forward/rules.before-restore.tsv
+cp /root/forward-backup.tsv /etc/nft-port-forward/rules.tsv
+chmod 600 /etc/nft-port-forward/rules.tsv
+nft-port-forward --apply
+```
+
+应用前会校验规则格式。如恢复失败，可以将 `rules.before-restore.tsv` 复制回 `rules.tsv`，再执行 `nft-port-forward --apply`。
 
 ## 保存位置
 
@@ -91,4 +136,4 @@ nft-port-forward --apply
 
 ## 验证状态
 
-已检查 POSIX shell 语法和输入校验的边界情况。尚未在 Alpine 实机验证内核规则加载、实际网络转发和 OpenRC 重启恢复。
+已检查 POSIX shell 语法、输入校验、导出文件与错误处理，并模拟验证锁占用、旧锁迁移和退出清理。尚未在 Alpine 实机验证内核文件锁、规则加载、实际网络转发和 OpenRC 重启恢复。
